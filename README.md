@@ -9,3 +9,6 @@
  - https://arxiv.org/pdf/2004.02760 - Depth-attention volume
  - https://arxiv.org/pdf/2208.03543 - Vision transformer
  - https://openaccess.thecvf.com/content_CVPR_2020/papers/Wang_SDC-Depth_Semantic_Divide-and-Conquer_Network_for_Monocular_Depth_Estimation_CVPR_2020_paper.pdf - Depth estimation using semantic segmentation
+
+2. Additional Resources considered
+ - https://youtu.be/IQJL3htsDyQ?si=s9Ctk--2rT60eBQ- - Mark Robert's video exploring the tools and techniques of depth estimation
