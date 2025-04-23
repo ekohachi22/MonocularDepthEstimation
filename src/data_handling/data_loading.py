@@ -33,23 +33,25 @@ def load_data(base_path: str) -> dict:
 
 
 class ImageDepthDataset(Dataset):
-    def __init__(self, X_list, Y_list, transform_x: callable=None, transform_y: callable=None):
+    def __init__(self, X_list, Y_list, transform=None):
         assert len(X_list) == len(Y_list), "Input and target lists must be the same length"
-        self.X_list = torch.Tensor(np.transpose(X_list, (0, 3, 1, 2)))
-        self.Y_list = torch.Tensor(np.transpose(Y_list, (0, 3, 1, 2)))
-        self.transform_x = transform_x
-        self.transform_y = transform_y
+        self.X_list = X_list  
+        self.Y_list = Y_list
+        self.transform = transform
 
     def __len__(self):
         return len(self.X_list)
 
     def __getitem__(self, idx):
-        x = self.X_list[idx]
-        y = self.Y_list[idx]
+        image = self.X_list[idx].astype(np.uint8)   
+        depth = self.Y_list[idx].astype(np.float32) 
 
-        if self.transform_x:
-            x = self.transform_x(x)
-        if self.transform_y:
-            y = self.transform_y(y)
+        if depth.ndim == 2:
+            depth = np.expand_dims(depth, axis=-1)  
 
-        return x, y
+        if self.transform:
+            augmented = self.transform(image=image, depth=depth)
+            image = augmented["image"]
+            depth = augmented["depth"]
+
+        return image, depth

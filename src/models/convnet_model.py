@@ -7,16 +7,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torch.nn import init
 
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+transform = A.Compose([
+    A.Resize(240, 320),
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.2),
+    ToTensorV2()
+], additional_targets={"depth": "image"})
 
 class ConvnetModel(BaseModel):
     def __init__(self):
         super().__init__()
-        self._model = _UNet(3)
+        self._model = _UNet(5)
 
     def train(self, X, Y, **kwargs):
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        train_val_dataset = ImageDepthDataset(X, Y)
+        train_val_dataset = ImageDepthDataset(X, Y, transform=transform)
 
         val_ratio = 0.2
         val_size = int(len(train_val_dataset) * val_ratio)
@@ -32,7 +42,7 @@ class ConvnetModel(BaseModel):
         val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
         self._model = self._model.to(device)
-        criterion = nn.MSELoss()
+        criterion = nn.L1Loss()
         optimizer = optim.Adam(self._model.parameters(), lr=lr)
 
         for epoch in range(n_epochs):
@@ -40,8 +50,8 @@ class ConvnetModel(BaseModel):
             train_loss = 0.0
 
             for inputs, targets in tqdm.tqdm(train_loader):
-                inputs = inputs.to(device)
-                targets = targets.to(device)
+                inputs = inputs.to(device).float()
+                targets = targets.to(device).float()
 
                 outputs = self._model(inputs)
                 loss = criterion(outputs, targets)
@@ -58,8 +68,8 @@ class ConvnetModel(BaseModel):
             val_loss = 0.0
             with torch.no_grad():
                 for inputs, targets in val_loader:
-                    inputs = inputs.to(device)
-                    targets = targets.to(device)
+                    inputs = inputs.to(device).float()
+                    targets = targets.to(device).float()
 
                     outputs = self._model(inputs)
                     loss = criterion(outputs, targets)
@@ -153,6 +163,8 @@ class _UNet(nn.Module):
         self.down_convs = nn.ModuleList(self.down_convs)
         self.up_convs = nn.ModuleList(self.up_convs)
 
+        self.reset_params()
+
     def forward(self, x):
         encoder_outs = []
 
@@ -165,4 +177,14 @@ class _UNet(nn.Module):
             x = module(before_pool, x)
 
         x = self.conv_final(x)
-        return F.sigmoid(x)
+        return x
+    
+    @staticmethod
+    def weight_init(m):
+        if isinstance(m, nn.Conv2d):
+            init.xavier_normal(m.weight)
+            init.constant(m.bias, 0)
+
+    def reset_params(self):
+        for i, m in enumerate(self.modules()):
+            self.weight_init(m)
