@@ -8,25 +8,95 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torch.nn import init
+from kornia.losses import ssim_loss
+
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import kornia.filters as KF
 
-transform = A.Compose([
-    A.Resize(240, 320),
-    A.HorizontalFlip(p=0.5),
-    A.RandomBrightnessContrast(p=0.2),
-    ToTensorV2()
-], additional_targets={"depth": "image"})
+shared_transforms = A.Compose(
+    [
+        A.Resize(224, 224),
+        A.HorizontalFlip(p=0.5),
+        ToTensorV2(),
+    ],
+    additional_targets={"depth": "image"},
+)
+
+input_only_transforms = A.Compose(
+    [
+        A.RandomGamma(p=0.3),
+        A.ColorJitter(p=0.3),
+        A.RandomBrightnessContrast(p=0.2),
+    ]
+)
+
+SAVE_PATH = "last_checkpoint.pth"
+
+def gradient_x(img):
+    return img[:, :, :, :-1] - img[:, :, :, 1:]
+
+def gradient_y(img):
+    return img[:, :, :-1, :] - img[:, :, 1:, :]
+
+def depth_smoothness_loss(depth, image):
+    dx_depth = gradient_x(depth)
+    dy_depth = gradient_y(depth)
+
+    dx_image = gradient_x(image)
+    dy_image = gradient_y(image)
+
+    weights_x = torch.exp(-torch.mean(torch.abs(dx_image), dim=1, keepdim=True))
+    weights_y = torch.exp(-torch.mean(torch.abs(dy_image), dim=1, keepdim=True))
+
+    smoothness_x = dx_depth * weights_x
+    smoothness_y = dy_depth * weights_y
+
+    return smoothness_x.abs().mean() + smoothness_y.abs().mean()
+
+class SSIMLoss(nn.Module):
+    def __init__(self, window_size=11):
+        super().__init__()
+        self.window_size = window_size
+
+    def forward(self, y_pred, y):
+        return ssim_loss(y_pred, y, window_size=self.window_size, reduction="mean")
+
+
+class ConvnetModelLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l1 = nn.L1Loss()
+        self.ssim = SSIMLoss()
+
+    def forward(self, y_pred, Y, X):
+        ssim_val = self.ssim(y_pred, Y)
+        smooth_val = depth_smoothness_loss(y_pred, X)
+        l1_val = self.l1(y_pred, Y)
+
+        #print(f"SSIM: {ssim_val.item()}, Smooth: {smooth_val.item()}, L1: {l1_val.item()}")
+
+        return 2 * ssim_val +  smooth_val + 0.001 * l1_val
+
+
 
 class ConvnetModel(BaseModel):
     def __init__(self):
         super().__init__()
-        self._model = _UNet(5)
+        self._model = _UNet(6)
 
     def train(self, X, Y, **kwargs):
+        max_iters_no_improvement = 2
+        iters_no_improvement = 0
+        min_val_loss = float("inf")
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        train_val_dataset = ImageDepthDataset(X, Y, transform=transform)
+        train_val_dataset = ImageDepthDataset(
+            X,
+            Y,
+            shared_transform=shared_transforms,
+            input_only_transform=input_only_transforms,
+        )
 
         val_ratio = 0.2
         val_size = int(len(train_val_dataset) * val_ratio)
@@ -42,8 +112,9 @@ class ConvnetModel(BaseModel):
         val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
 
         self._model = self._model.to(device)
-        criterion = nn.L1Loss()
+        criterion = ConvnetModelLoss()
         optimizer = optim.Adam(self._model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
 
         for epoch in range(n_epochs):
             self._model.train()
@@ -54,7 +125,7 @@ class ConvnetModel(BaseModel):
                 targets = targets.to(device).float()
 
                 outputs = self._model(inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, inputs)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -72,10 +143,25 @@ class ConvnetModel(BaseModel):
                     targets = targets.to(device).float()
 
                     outputs = self._model(inputs)
-                    loss = criterion(outputs, targets)
+                    loss = criterion(outputs, targets, inputs)
                     val_loss += loss.item()
 
             avg_val_loss = val_loss / len(val_loader)
+            scheduler.step(avg_val_loss)
+
+            if avg_val_loss < min_val_loss:
+                min_val_loss = avg_val_loss
+                iters_no_improvement = 0
+                torch.save(self._model.state_dict(), SAVE_PATH)
+
+            else:
+                iters_no_improvement += 1
+                if iters_no_improvement == max_iters_no_improvement:
+                    print(
+                        f"{iters_no_improvement} iterations reached with no improvement to validation loss! stopping..."
+                    )
+                    self._model.load_state_dict(torch.load(SAVE_PATH, weights_only=True))
+                    break
 
             print(
                 f"Epoch [{epoch+1}/{n_epochs}] - Train Loss: {avg_train_loss:.4f} - Val Loss: {avg_val_loss:.4f}"
@@ -86,50 +172,53 @@ class ConvnetModel(BaseModel):
 
 
 class _EncoderBlock(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, stride=1, padding=1, pooling: bool = True
-    ):
+    def __init__(self, in_channels, out_channels, stride=1, padding=1, pooling: bool = True):
         super().__init__()
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, stride=stride, padding=1
-        )
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, stride=stride, padding=1
-        )
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+        self.relu2 = nn.ReLU()
 
         self.pooling = pooling
         if self.pooling:
             self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
         before_pool = x
         if self.pooling:
             x = self.pool(x)
         return x, before_pool
 
+    def fuse_model(self):
+        torch.quantization.fuse_modules(self, [['conv1', 'relu1'], ['conv2', 'relu2']], inplace=True)
+
+
 
 class _DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.upconv = nn.ConvTranspose2d(
-            in_channels, out_channels, kernel_size=2, stride=2
-        )
+        self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
 
-        self.conv1 = nn.Conv2d(
-            2 * out_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv1 = nn.Conv2d(2 * out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.relu2 = nn.ReLU()
+
+        self.dropout = nn.Dropout2d(p=0.1)
 
     def forward(self, encoder_tensor, decoder_tensor):
         decoder_tensor = self.upconv(decoder_tensor)
         x = torch.cat((decoder_tensor, encoder_tensor), 1)
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
+        x = self.dropout(x)
+        x = self.relu1(self.conv1(x))
+        x = self.relu2(self.conv2(x))
         return x
+
+    def fuse_model(self):
+        torch.quantization.fuse_modules(self, [['conv1', 'relu1'], ['conv2', 'relu2']], inplace=True)
+
 
 
 class _UNet(nn.Module):
@@ -143,6 +232,8 @@ class _UNet(nn.Module):
         self.depth = depth
         self.start_filters = start_filters
         self.in_channels = in_channels
+        self.quant = torch.ao.quantization.QuantStub()
+        self.dequant = torch.ao.quantization.DeQuantStub()
 
         for i in range(depth):
             ins = self.in_channels if i == 0 else outs
@@ -168,6 +259,8 @@ class _UNet(nn.Module):
     def forward(self, x):
         encoder_outs = []
 
+        x = self.quant(x)
+
         for i, module in enumerate(self.down_convs):
             x, before_pool = module(x)
             encoder_outs.append(before_pool)
@@ -177,8 +270,18 @@ class _UNet(nn.Module):
             x = module(before_pool, x)
 
         x = self.conv_final(x)
-        return x
+        x = self.dequant(x)
+        return torch.relu(x)
     
+    def fuse_model(self):
+        for module in self.down_convs:
+            if hasattr(module, 'fuse_model'):
+                module.fuse_model()
+        for module in self.up_convs:
+            if hasattr(module, 'fuse_model'):
+                module.fuse_model()
+
+
     @staticmethod
     def weight_init(m):
         if isinstance(m, nn.Conv2d):

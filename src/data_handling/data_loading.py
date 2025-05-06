@@ -33,24 +33,25 @@ def load_data(base_path: str) -> dict:
 
 
 class ImageDepthDataset(Dataset):
-    def __init__(self, X_list, Y_list, transform=None):
-        assert len(X_list) == len(Y_list), "Input and target lists must be the same length"
-        self.X_list = X_list  
+    def __init__(self, X_list, Y_list, input_only_transform=None, shared_transform=None):
+        self.X_list = X_list
         self.Y_list = Y_list
-        self.transform = transform
+        self.input_only_transform = input_only_transform
+        self.shared_transform = shared_transform
 
     def __len__(self):
         return len(self.X_list)
 
     def __getitem__(self, idx):
-        image = self.X_list[idx].astype(np.uint8)   
-        depth = self.Y_list[idx].astype(np.float32) 
+        image = self.X_list[idx].astype(np.uint8)
+        depth = self.Y_list[idx].astype(np.float32)
 
-        if depth.ndim == 2:
-            depth = np.expand_dims(depth, axis=-1)  
+        if self.input_only_transform:
+            augmented = self.input_only_transform(image=image)
+            image = augmented["image"]
 
-        if self.transform:
-            augmented = self.transform(image=image, depth=depth)
+        if self.shared_transform:
+            augmented = self.shared_transform(image=image, depth=depth)
             image = augmented["image"]
             depth = augmented["depth"]
 
